@@ -131,7 +131,11 @@ func main() {
 	if err := s.processParallel(ctx, files); err != nil {
 		if err == context.Canceled {
 			fmt.Println("\n[!] Canceled (Ctrl-C).")
-			fmt.Println("Database not saved because run was canceled.")
+			if !s.dryRun {
+				if err := s.db.Save(); err != nil {
+					fmt.Fprintln(os.Stderr, err)
+				}
+			}
 			os.Exit(130)
 		}
 		fmt.Println("\n==================================================")
@@ -150,7 +154,11 @@ func main() {
 	if err := s.removeDeletedAndOrphans(ctx, current); err != nil {
 		if err == context.Canceled {
 			fmt.Println("\n[!] Canceled (Ctrl-C).")
-			fmt.Println("Database not saved because run was canceled.")
+			if !s.dryRun {
+				if err := s.db.Save(); err != nil {
+					fmt.Fprintln(os.Stderr, err)
+				}
+			}
 			os.Exit(130)
 		}
 		fmt.Fprintln(os.Stderr, err)
