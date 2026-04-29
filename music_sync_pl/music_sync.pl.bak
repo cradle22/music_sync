@@ -1,0 +1,681 @@
+#!/usr/bin/env perl
+# Music Folder Synchronization Tool
+# Syncs audio files from source to target, transcoding FLAC/MPC to MP3
+# while preserving metadata.
+#
+# Translated from Python to Perl 5.
+
+use strict;
+use warnings;
+use 5.010;
+
+use File::Find      qw(find);
+use File::Path      qw(make_path);
+use File::Copy      qw(copy);
+use File::Basename  qw(basename dirname);
+use File::Spec;
+use Cwd             qw(abs_path);
+use JSON::PP;
+use POSIX           qw(strftime);
+use Getopt::Long    qw(:config no_auto_abbrev);
+use threads;
+use threads::shared;
+use Thread::Queue;
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+my %AUDIO_EXTENSIONS     = map { $_ => 1 } qw(.flac .mp3 .ogg .mpc .aac .m4a);
+my %COPY_EXTENSIONS      = map { $_ => 1 } qw(.mp3 .ogg .aac .m4a);
+my %TRANSCODE_EXTENSIONS = map { $_ => 1 } qw(.flac .mpc);
+my %PLAYLIST_EXTENSIONS  = map { $_ => 1 } qw(.m3u .m3u8);
+my $DB_FILENAME          = '.music_sync_db.json';
+
+# ---------------------------------------------------------------------------
+# Thread-safe statistics
+# ---------------------------------------------------------------------------
+my %stats : shared = (copied => 0, transcoded => 0, skipped => 0, deleted => 0);
+
+sub inc_stat {
+    my ($key) = @_;
+    lock(%stats);
+    $stats{$key}++;
+}
+
+# ---------------------------------------------------------------------------
+# Helper: relative path of $path under $base (both absolute strings)
+# ---------------------------------------------------------------------------
+sub rel_path {
+    my ($base, $path) = @_;
+    $base =~ s{/?$}{/};
+    (my $rel = $path) =~ s{^\Q$base\E}{};
+    return $rel;
+}
+
+# ---------------------------------------------------------------------------
+# Helper: replace/add extension
+# ---------------------------------------------------------------------------
+sub with_suffix {
+    my ($path, $new_ext) = @_;
+    $path =~ s/\.[^.\/]+$//;
+    return $path . $new_ext;
+}
+
+# ---------------------------------------------------------------------------
+# Helper: make parent directories for a file path
+# ---------------------------------------------------------------------------
+sub mkdir_p_for {
+    my ($path) = @_;
+    my $dir = -d $path ? $path : dirname($path);
+    make_path($dir) unless -d $dir;
+}
+
+# ---------------------------------------------------------------------------
+# Helper: check for an executable in PATH
+# ---------------------------------------------------------------------------
+sub has_tool {
+    my ($cmd) = @_;
+    for my $dir (split /:/, $ENV{PATH} // '') {
+        return 1 if -x File::Spec->catfile($dir, $cmd);
+    }
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# Helper: number of CPUs
+# ---------------------------------------------------------------------------
+sub cpu_count {
+    my $n = `nproc 2>/dev/null`;
+    chomp $n;
+    return ($n && $n =~ /^\d+$/) ? int($n) : 4;
+}
+
+# ===========================================================================
+# DB functions  (operate on a plain hashref  $db)
+# ===========================================================================
+
+sub db_load {
+    my ($db_path) = @_;
+    if (-f $db_path) {
+        open my $fh, '<:utf8', $db_path
+            or do { warn "Warning: Cannot open database file: $!\n";
+                    return db_empty(); };
+        local $/;
+        my $raw = <$fh>;
+        close $fh;
+        my $data = eval { JSON::PP->new->decode($raw) };
+        if ($@) {
+            warn "Warning: Corrupted database file, starting fresh\n";
+            return db_empty();
+        }
+        return $data;
+    }
+    return db_empty();
+}
+
+sub db_empty {
+    return { files => {}, global_metadata => { last_runid => 0 } };
+}
+
+sub db_new {
+    my ($db_path) = @_;
+    my $db = {
+        db_path => $db_path,
+        data    => db_load($db_path),
+    };
+    db_initialize_run($db);
+    return $db;
+}
+
+sub db_initialize_run {
+    my ($db) = @_;
+    $db->{data}{global_metadata} //= { last_runid => 0 };
+
+    $db->{current_runtime} = strftime('%Y-%m-%dT%H:%M:%S', localtime);
+    $db->{current_runid}   = ($db->{data}{global_metadata}{last_runid} // 0) + 1;
+
+    $db->{data}{global_metadata}{last_runid}   = $db->{current_runid};
+    $db->{data}{global_metadata}{last_runtime} = $db->{current_runtime};
+
+    print "--- Starting Sync Run #$db->{current_runid} at $db->{current_runtime} ---\n";
+}
+
+sub db_save {
+    my ($db) = @_;
+    open my $fh, '>:utf8', $db->{db_path}
+        or die "Cannot write database: $!\n";
+    print $fh JSON::PP->new->pretty->canonical->encode($db->{data});
+    close $fh;
+    print "Database saved to $db->{db_path}\n";
+}
+
+sub db_file_hash {
+    my ($filepath) = @_;
+    my @st = stat($filepath) or return '';
+    return sprintf("%d:%d", $st[9], $st[7]);
+}
+
+sub db_is_file_changed {
+    my ($db, $source_path, $rel_path) = @_;
+    my $current = db_file_hash($source_path);
+    my $stored  = ($db->{data}{files}{$rel_path} // {})->{hash} // '';
+    $stored =~ s/^(\d+)\.0(:)/$1$2/;
+    return $current ne $stored;
+}
+
+sub db_update_file {
+    my ($db, $rel_path, $source_path, $target_path, $rel_target_path) = @_;
+    my $currentHash = db_file_hash($source_path);
+    $currentHash =~ s/^(\d+)\.0(:)/$1$2/;
+    $db->{data}{files}{$rel_path} = {
+        hash       => $currentHash,
+        target     => $target_path,
+        rel_target => $rel_target_path,
+        runid      => $db->{current_runid},
+        runtime    => $db->{current_runtime},
+    };
+}
+
+sub db_get_all_synced_files {
+    my ($db) = @_;
+    return keys %{ $db->{data}{files} };
+}
+
+sub db_remove_file {
+    my ($db, $rel_path) = @_;
+    delete $db->{data}{files}{$rel_path};
+}
+
+sub db_print_runs {
+    my ($db) = @_;
+    my %runs;
+    for my $info (values %{ $db->{data}{files} // {} }) {
+        my $rid  = $info->{runid};
+        my $time = $info->{runtime};
+        $runs{$rid} = $time if defined $rid;
+    }
+    for my $rid (sort { $a <=> $b } keys %runs) {
+        print "Run ID: $rid | Timestamp: $runs{$rid}\n";
+    }
+}
+
+sub db_get_files_by_run {
+    my ($db, $runid) = @_;
+    my @results;
+    for my $info (values %{ $db->{data}{files} // {} }) {
+        if (defined $info->{runid} && $info->{runid} == $runid) {
+            push @results, [ $info->{target}, $info->{rel_target} ];
+        }
+    }
+    return @results;
+}
+
+# ===========================================================================
+# Syncer functions  (operate on a plain hashref  $s)
+# ===========================================================================
+
+sub syncer_new {
+    my (%args) = @_;
+    return {
+        source    => abs_path($args{source}),
+        target    => abs_path($args{target}),
+        db        => $args{db},
+        dry_run   => $args{dry_run}   // 0,
+        copy_only => $args{copy_only} // 0,
+        threads   => $args{threads}   // cpu_count(),
+        update_hash => $args{update_hash} // 0,
+    };
+}
+
+sub syncer_get_target_path {
+    my ($s, $source_path, $new_ext) = @_;
+    my $rel = rel_path($s->{source}, $source_path);
+    my $tgt = File::Spec->catfile($s->{target}, $rel);
+    $tgt = with_suffix($tgt, $new_ext) if defined $new_ext;
+    return $tgt;
+}
+
+sub syncer_check_dependencies {
+    my ($s) = @_;
+    my @missing = grep { !has_tool($_) } qw(ffmpeg);
+    if (@missing) {
+        print "Error: Missing required tools: " . join(', ', @missing) . "\n";
+        print "Please install: sudo dnf install ffmpeg\n";
+        exit 1;
+    }
+}
+
+sub syncer_copy_file {
+    my ($s, $source_path, $target_path) = @_;
+    if ($s->{dry_run}) {
+        print "[DRY RUN] Would copy: $source_path -> $target_path\n";
+        return;
+    }
+    mkdir_p_for($target_path);
+    copy($source_path, $target_path)
+        or die "Copy failed $source_path -> $target_path: $!\n";
+    print "Copied: " . basename($source_path) . "\n";
+    inc_stat('copied');
+}
+
+sub syncer_handle_playlist {
+  my ($s, $source_file, $target_file) = @_;
+
+  if ($s->{dry_run}) {
+    print "[DRY RUN] Would handle playlist: $source_file -> $target_file\n";
+    return;
+  }
+
+  # Identify the base directories for path replacement logic
+  my $source_dir = dirname($source_file);
+  my $target_dir = dirname($target_file);
+
+  # Open with ':utf8' or ':raw' depending on your specific m3u8 needs.
+  # m3u8 is technically UTF-8 by definition.
+  open(my $in, "<:encoding(UTF-8)", $source_file) or die "Cannot open source: $!";
+  open(my $out, ">:encoding(UTF-8)", $target_file) or die "Cannot open target: $!";
+
+  while (my $line = <$in>) {
+    # 1. Discard lines starting with #
+    next if $line =~ /^#/;
+
+    # Remove newline for processing
+    chomp $line;
+    next if $line eq '';
+
+    # 2. Replace Windows separators with Linux ones
+    $line =~ s/\\/\//g;
+
+    my ($ext) = ($line =~ /(\.[^.\/]+)$/);
+    $ext = lc($ext // '');
+
+    # 3. Handle path rewriting
+    # Check if path is absolute
+    if (File::Spec->file_name_is_absolute($line)) {
+      # If the line starts with the source directory path
+      if (index($line, $source_dir) == 0) {
+        # Extract the relative portion and prepend the target directory
+        my $relative_part = substr($line, length($source_dir));
+        $line = $target_dir . $relative_part;
+      }
+    }
+    # If relative, we leave it as is (already handled by the \ to / swap)
+
+    # handle possible transcoding
+    if($TRANSCODE_EXTENSIONS{$ext}) {
+      $line = with_suffix($line, ".mp3")
+    }
+    print $out "$line\n";
+  }
+  close($in);
+  close($out);
+}
+
+sub syncer_get_replaygain {
+    my ($source_path) = @_;
+    my $quoted = $source_path;
+    $quoted =~ s/'/'\\''/g;
+    my $out = `ffprobe -v quiet -show_entries format_tags=replaygain_track_gain -of default=noprint_wrappers=1:nokey=1 '$quoted' 2>/dev/null`;
+    chomp $out;
+    return undef unless $out =~ /\S/;
+    my ($gain) = split /\s+/, $out;
+    return undef unless defined $gain && $gain =~ /^-?\d+(\.\d+)?$/;
+    return $gain + 0;
+}
+
+sub syncer_transcode_to_mp3 {
+    my ($s, $source_path, $target_path) = @_;
+    if ($s->{dry_run}) {
+        print "[DRY RUN] Would transcode: $source_path -> $target_path\n";
+        return;
+    }
+    mkdir_p_for($target_path);
+
+    my @cmd = (
+        'ffmpeg',
+        '-i',             $source_path,
+        '-c:a',           'libmp3lame',
+        '-q:a',           '0',
+        '-map',           '0:a',
+        '-map',           '0:v?',
+        '-id3v2_version', '3',
+        '-write_id3v1',   '1',
+        '-y',
+    );
+
+    my $rg = syncer_get_replaygain($source_path);
+    if (defined $rg) {
+        push @cmd, ('-af', "volume=${rg}dB");
+        print "Applying ReplayGain: ${rg}dB to " . basename($source_path) . "\n";
+    }
+
+    push @cmd, $target_path;
+
+    my $stderr_output = '';
+    {
+        open my $fh, '-|', @cmd, '2>&1'
+            or die "Cannot run ffmpeg: $!\n";
+        while (<$fh>) { $stderr_output .= $_; }
+        close $fh;
+    }
+    if ($? != 0) {
+        die "Error transcoding $source_path:\n$stderr_output\n";
+    }
+    print "Transcoded: " . basename($source_path) . " -> " . basename($target_path) . "\n";
+    inc_stat('transcoded');
+}
+
+sub syncer_sync_file {
+    my ($s, $source_path) = @_;
+    my $rel_path = rel_path($s->{source}, $source_path);
+
+    my ($ext) = ($source_path =~ /(\.[^.\/]+)$/);
+    my $target_path;
+    $ext = lc($ext // '');
+
+    if ($s->{copy_only} || $COPY_EXTENSIONS{$ext}) {
+        $target_path = syncer_get_target_path($s, $source_path);
+    } elsif ($TRANSCODE_EXTENSIONS{$ext}) {
+        $target_path = syncer_get_target_path($s, $source_path, '.mp3');
+    } elsif ($PLAYLIST_EXTENSIONS{$ext}) {
+        $target_path = syncer_get_target_path($s, $source_path);
+    } else {
+        return;
+    }
+    my $rel_target = rel_path($s->{target}, $target_path);
+
+    if($s->{update_hash} && -f $target_path) {
+        print "Updating hash for: $target_path\n";
+        return {
+            rel_path   => $rel_path,
+            source_path => $source_path,
+            target_path => $target_path,
+            rel_target  => $rel_target,
+        };
+    }
+    if (!db_is_file_changed($s->{db}, $source_path, $rel_path)) {
+        inc_stat('skipped');
+        return undef;
+    }
+    if ($s->{copy_only} || $COPY_EXTENSIONS{$ext}) {
+        syncer_copy_file($s, $source_path, $target_path);
+        return {
+            rel_path   => $rel_path,
+            source_path => $source_path,
+            target_path => $target_path,
+            rel_target  => $rel_target,
+        };
+    } elsif ($TRANSCODE_EXTENSIONS{$ext}) {
+        syncer_transcode_to_mp3($s, $source_path, $target_path);
+        return {
+            rel_path   => $rel_path,
+            source_path => $source_path,
+            target_path => $target_path,
+            rel_target  => $rel_target,
+        };
+    } elsif ($PLAYLIST_EXTENSIONS{$ext}) {
+        syncer_handle_playlist($s, $source_path, $target_path);
+    }
+
+    return undef;
+}
+
+sub syncer_collect_files {
+    my ($s) = @_;
+    my @files;
+    find(sub {
+        return if -d $_;
+        my ($ext) = ($_ =~ /(\.[^.\/]+)$/);
+        $ext = lc($ext // '');
+        push @files, $File::Find::name if $AUDIO_EXTENSIONS{$ext};
+    }, $s->{source});
+    return @files;
+}
+
+sub syncer_process_files_parallel {
+    my ($s, @source_files) = @_;
+
+    print "Compiling list of files to process\n";
+    my @to_process;
+    for my $path (@source_files) {
+        if ($s->{update_hash}) {
+            push @to_process, $path;
+            next;
+        }
+
+        my $rel = rel_path($s->{source}, $path);
+        if (db_is_file_changed($s->{db}, $path, $rel)) {
+            push @to_process, $path;
+        } else {
+            inc_stat('skipped');
+        }
+    }
+
+    unless (@to_process) {
+        print "No files need processing\n";
+        return;
+    }
+
+    my $n = $s->{threads};
+    print "Processing " . scalar(@to_process) . " files using $n threads...\n";
+
+    my $queue = Thread::Queue->new();
+    my $update_queue = Thread::Queue->new();
+    $queue->enqueue($_) for @to_process;
+    $queue->end();
+
+    my $abort : shared = 0;
+
+    local $SIG{INT} = sub {
+        print "\n[!] Ctrl-C detected. Canceling all pending tasks...\n";
+        lock($abort); $abort = 1;
+    };
+
+    my @workers;
+    for (1 .. $n) {
+        push @workers, threads->create(sub {
+            while (defined(my $path = $queue->dequeue_nb())) {
+                { lock($abort); last if $abort; }
+                eval {
+                    my $update = syncer_sync_file($s, $path);
+                    $update_queue->enqueue($update) if $update;
+                };
+                if ($@) {
+                    print "Error processing " . basename($path) . ": $@\n";
+                }
+            }
+        });
+    }
+    $_->join() for @workers;
+
+    $update_queue->end();
+    while (defined(my $update = $update_queue->dequeue_nb())) {
+        db_update_file(
+            $s->{db},
+            $update->{rel_path},
+            $update->{source_path},
+            $update->{target_path},
+            $update->{rel_target},
+        );
+    }
+}
+
+sub syncer_remove_deleted_files {
+    my ($s, %current_files) = @_;
+    my @synced = db_get_all_synced_files($s->{db});
+
+    for my $rel_path (@synced) {
+        next if exists $current_files{$rel_path};
+
+        my $info            = $s->{db}{data}{files}{$rel_path} // {};
+        my $target_abs      = $info->{target}     // '';
+        my $rel_target_path = $info->{rel_target} // '';
+        my $deleted = 0;
+
+        if ($target_abs && -f $target_abs) {
+            $deleted = 1;
+            if ($s->{dry_run}) {
+                print "[DRY RUN] Would delete: $target_abs\n";
+            } else {
+                unlink $target_abs or warn "Cannot delete $target_abs: $!\n";
+                print "Deleted: $target_abs\n";
+                inc_stat('deleted');
+            }
+        }
+
+        if (!$deleted && $rel_target_path) {
+            my $fallback = File::Spec->catfile($s->{target}, $rel_target_path);
+            if (-f $fallback) {
+                $deleted = 1;
+                if ($s->{dry_run}) {
+                    print "[DRY RUN] Would delete: $fallback\n";
+                } else {
+                    unlink $fallback or warn "Cannot delete $fallback: $!\n";
+                    print "Deleted: $fallback\n";
+                    inc_stat('deleted');
+                }
+            }
+        }
+
+        db_remove_file($s->{db}, $rel_path) if $deleted;
+    }
+}
+
+sub syncer_dump_run {
+    my ($s, $runid, $dump_path) = @_;
+    my @files = db_get_files_by_run($s->{db}, $runid);
+    unless (@files) {
+        print "No files found for Run ID: $runid\n";
+        return;
+    }
+    print "Dumping " . scalar(@files) . " files from Run $runid to $dump_path...\n";
+    for my $entry (@files) {
+        my ($abs_src, $rel_path) = @$entry;
+        unless (-f $abs_src) {
+            print "Warning: Source file $abs_src missing, skipping.\n";
+            next;
+        }
+        my $dest = File::Spec->catfile($dump_path, $rel_path);
+        if ($s->{dry_run}) {
+            print "[DRY RUN] Would copy $abs_src -> $dest\n";
+        } else {
+            mkdir_p_for($dest);
+            copy($abs_src, $dest) or warn "Copy failed: $!\n";
+            print "Dumped: $rel_path\n";
+        }
+    }
+}
+
+sub syncer_sync {
+    my ($s) = @_;
+    print "Syncing: $s->{source} -> $s->{target}\n";
+    print "Using $s->{threads} parallel threads\n";
+
+    my @source_files;
+    eval {
+        print "Scanning source directory...\n";
+        @source_files = syncer_collect_files($s);
+        print "Found " . scalar(@source_files) . " audio files\n";
+
+        syncer_process_files_parallel($s, sort @source_files);
+
+        print "\nChecking for deleted files...\n";
+        my %src_set = map { rel_path($s->{source}, $_) => 1 } @source_files;
+        syncer_remove_deleted_files($s, %src_set);
+    };
+    if ($@ && $@ !~ /^Interrupted/) {
+        print "\n" . ("=" x 50) . "\nSync interrupted!\n";
+    }
+
+    db_save($s->{db}) unless $s->{dry_run};
+
+    print "\n" . ("=" x 50) . "\n";
+    print "Sync complete!\n";
+    print "  Copied:              $stats{copied}\n";
+    print "  Transcoded:          $stats{transcoded}\n";
+    print "  Skipped (unchanged): $stats{skipped}\n";
+    print "  Deleted:             $stats{deleted}\n";
+    print "=" x 50 . "\n";
+}
+
+# ===========================================================================
+# main
+# ===========================================================================
+
+sub usage {
+    print <<'END';
+Usage: music_sync.pl <source> <target> [options]
+
+  --print               Print all distinct run IDs and runtimes
+  --dump RUNID          Copy all files from a specific run ID to --dump-target
+  --dump-target PATH    Target folder for --dump
+  --dry-run             Show what would be done without making changes
+  --copy-only           Copy all files without transcoding
+  --threads|-j N        Number of parallel threads (default: CPU count)
+  --db PATH             Database file location (default: target/.music_sync_db.json)
+  --update-hash         Updates the hash if the target file exists
+END
+    exit 1;
+}
+
+my ($opt_print, $opt_dump, $opt_dump_target);
+my ($opt_dry_run, $opt_copy_only, $opt_update_hash);
+my ($opt_threads, $opt_db);
+
+GetOptions(
+    'print'         => \$opt_print,
+    'dump=i'        => \$opt_dump,
+    'dump-target=s' => \$opt_dump_target,
+    'dry-run'       => \$opt_dry_run,
+    'copy-only'     => \$opt_copy_only,
+    'threads|j=i'   => \$opt_threads,
+    'db=s'          => \$opt_db,
+    'update-hash'   => \$opt_update_hash,
+) or usage();
+
+my ($opt_source, $opt_target) = @ARGV;
+usage() unless defined $opt_source && defined $opt_target;
+
+unless (-e $opt_source) {
+    print "Error: Source folder does not exist: $opt_source\n";
+    exit 1;
+}
+unless (-d $opt_source) {
+    print "Error: Source is not a directory: $opt_source\n";
+    exit 1;
+}
+
+make_path($opt_target) unless -d $opt_target;
+
+my $db_path = $opt_db // File::Spec->catfile($opt_target, $DB_FILENAME);
+my $db      = db_new($db_path);
+
+# maybe just print all prior runs
+if ($opt_print) {
+    db_print_runs($db);
+    exit 0;
+}
+
+my $syncer = syncer_new(
+    source    => $opt_source,
+    target    => $opt_target,
+    db        => $db,
+    dry_run   => $opt_dry_run   // 0,
+    copy_only => $opt_copy_only // 0,
+    threads   => $opt_threads,
+    update_hash => $opt_update_hash // 0,
+);
+
+# maybe dump all files from a prior run
+if (defined $opt_dump) {
+    unless ($opt_dump_target) {
+        print "Error: --dump requires --dump-target\n";
+        exit 1;
+    }
+    syncer_dump_run($syncer, $opt_dump, $opt_dump_target);
+    exit 0;
+}
+
+# no, really sync
+syncer_check_dependencies($syncer) unless $opt_copy_only;
+syncer_sync($syncer);

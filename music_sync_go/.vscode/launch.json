@@ -1,0 +1,18 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug music_sync",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}",
+      "args": [
+        "--threads=1",
+        "/home/cradle/Shares/music/Other/",
+        "/home/cradle/Shares/music/Handy_Music/",
+        
+      ]
+    }
+  ]
+}
