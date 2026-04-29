@@ -34,7 +34,7 @@ type syncer struct {
 	pids map[int]struct{}
 }
 
-func newSyncer(source, target string, d *db, dry, copyOnly bool, threads int, updateHash bool) (*syncer, error) {
+func newSyncer(source, target string, myDb *db, dry, copyOnly bool, threads int, updateHash bool) (*syncer, error) {
 	sa, err := filepath.Abs(source)
 	if err != nil {
 		return nil, err
@@ -49,7 +49,7 @@ func newSyncer(source, target string, d *db, dry, copyOnly bool, threads int, up
 	return &syncer{
 		sourceAbs:  sa,
 		targetAbs:  ta,
-		db:         d,
+		db:         myDb,
 		dryRun:     dry,
 		copyOnly:   copyOnly,
 		threads:    threads,
@@ -64,6 +64,177 @@ func (s *syncer) checkDeps() {
 		fmt.Println("Please install: sudo dnf install ffmpeg")
 		os.Exit(1)
 	}
+}
+
+func (s *syncer) processParallel(ctx context.Context, files []string) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	fmt.Println("Compiling list of files to process")
+	toProcess := make([]string, 0, len(files))
+	for _, p := range files {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if s.updateHash {
+			toProcess = append(toProcess, p)
+			continue
+		}
+		rel := relPathUnder(s.sourceAbs, p)
+		relKey := pathKey(rel)
+
+		ext := strings.ToLower(filepath.Ext(p))
+
+		var targetAbs string
+		if plExtensions[ext] {
+			targetAbs = s.targetPathFor(p, nil)
+		} else if s.copyOnly || copyExtensions[ext] {
+			targetAbs = s.targetPathFor(p, nil)
+		} else if transExtensions[ext] {
+			mp3 := ".mp3"
+			targetAbs = s.targetPathFor(p, &mp3)
+		}
+
+		if targetAbs == "" {
+			continue
+		}
+		if _, err := os.Stat(targetAbs); err != nil || s.db.IsFileChanged(p, relKey) {
+			toProcess = append(toProcess, p)
+		} else {
+			s.st.skipped.Add(1)
+		}
+	}
+
+	if len(toProcess) == 0 {
+		fmt.Println("No files need processing")
+		return nil
+	}
+
+	n := s.threads
+	fmt.Printf("Processing %d files using %d threads...\n", len(toProcess), n)
+	sort.Strings(toProcess)
+
+	workCh := make(chan string)
+	updateCh := make(chan *updateInfo, 1024)
+	errCh := make(chan error, 1)
+
+	// Enqueue
+	go func() {
+		defer close(workCh)
+		for _, p := range toProcess {
+			select {
+			case <-ctx.Done():
+				return
+			case workCh <- p:
+			}
+		}
+	}()
+
+	var wg sync.WaitGroup
+	worker := func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case p, ok := <-workCh:
+				if !ok {
+					return
+				}
+				upd, err := s.syncOne(ctx, p)
+				if err != nil {
+					cancel()
+					// Cancel everyone and stop ffmpeg
+					s.terminateActiveFFmpeg()
+					select {
+					case errCh <- err:
+					default:
+					}
+					return
+				}
+				if upd != nil {
+					updateCh <- upd
+				}
+			}
+		}
+	}
+
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go worker()
+	}
+
+	// Close updateCh after workers finish
+	go func() {
+		wg.Wait()
+		close(updateCh)
+	}()
+
+	// Apply updates serially
+	for upd := range updateCh {
+		s.db.Update(upd.RelKey, upd.SourceAbs, upd.TargetAbs, upd.RelTarget)
+	}
+
+	select {
+	case err := <-errCh:
+		return err
+	default:
+		return ctx.Err()
+	}
+}
+
+func (s *syncer) syncOne(ctx context.Context, sourceAbs string) (*updateInfo, error) {
+	rel := relPathUnder(s.sourceAbs, sourceAbs)
+	relKey := pathKey(rel)
+
+	ext := strings.ToLower(filepath.Ext(sourceAbs))
+
+	var targetAbs string
+	if plExtensions[ext] {
+		targetAbs = s.targetPathFor(sourceAbs, nil)
+	} else if s.copyOnly || copyExtensions[ext] {
+		targetAbs = s.targetPathFor(sourceAbs, nil)
+	} else if transExtensions[ext] {
+		mp3 := ".mp3"
+		targetAbs = s.targetPathFor(sourceAbs, &mp3)
+	} else {
+		return nil, nil
+	}
+	relTarget := relPathUnder(s.targetAbs, targetAbs)
+
+	if s.updateHash {
+		if _, err := os.Stat(targetAbs); err == nil {
+			fmt.Printf("Updating hash for: %s\n", targetAbs)
+			return &updateInfo{RelKey: relKey, SourceAbs: sourceAbs, TargetAbs: targetAbs, RelTarget: relTarget}, nil
+		}
+	}
+
+	if _, err := os.Stat(targetAbs); err != nil {
+		fmt.Printf("Target missing, reprocessing: %s\n", targetAbs)
+	} else if !s.db.IsFileChanged(sourceAbs, relKey) {
+		s.st.skipped.Add(1)
+		return nil, nil
+	}
+
+	if plExtensions[ext] {
+		if err := s.handlePlaylist(sourceAbs, targetAbs); err != nil {
+			return nil, err
+		}
+		return &updateInfo{RelKey: relKey, SourceAbs: sourceAbs, TargetAbs: targetAbs, RelTarget: relTarget}, nil
+	}
+	if s.copyOnly || copyExtensions[ext] {
+		if err := s.copyFile(sourceAbs, targetAbs); err != nil {
+			return nil, err
+		}
+		return &updateInfo{RelKey: relKey, SourceAbs: sourceAbs, TargetAbs: targetAbs, RelTarget: relTarget}, nil
+	}
+	if transExtensions[ext] {
+		if err := s.transcodeToMP3(ctx, sourceAbs, targetAbs); err != nil {
+			return nil, err
+		}
+		return &updateInfo{RelKey: relKey, SourceAbs: sourceAbs, TargetAbs: targetAbs, RelTarget: relTarget}, nil
+	}
+	return nil, nil
 }
 
 func (s *syncer) targetPathFor(sourceAbs string, newExt *string) string {
@@ -252,7 +423,7 @@ func (s *syncer) transcodeToMP3(ctx context.Context, sourceAbs, targetAbs string
 	cancel()
 
 	if rg != nil {
-		fmt.Printf("Applying ReplayGain: %gdB to %s\n", *rg, filepath.Base(sourceAbs))
+		//fmt.Printf("Applying ReplayGain: %gdB to %s\n", *rg, filepath.Base(sourceAbs))
 		args = append(args, "-af", fmt.Sprintf("volume=%gdB", *rg))
 	}
 	args = append(args, targetAbs)
@@ -294,60 +465,6 @@ type updateInfo struct {
 	RelTarget string
 }
 
-func (s *syncer) syncOne(ctx context.Context, sourceAbs string) (*updateInfo, error) {
-	rel := relPathUnder(s.sourceAbs, sourceAbs)
-	relKey := pathKey(rel)
-
-	ext := strings.ToLower(filepath.Ext(sourceAbs))
-
-	var targetAbs string
-	if plExtensions[ext] {
-		targetAbs = s.targetPathFor(sourceAbs, nil)
-	} else if s.copyOnly || copyExtensions[ext] {
-		targetAbs = s.targetPathFor(sourceAbs, nil)
-	} else if transExtensions[ext] {
-		mp3 := ".mp3"
-		targetAbs = s.targetPathFor(sourceAbs, &mp3)
-	} else {
-		return nil, nil
-	}
-	relTarget := relPathUnder(s.targetAbs, targetAbs)
-
-	if s.updateHash {
-		if _, err := os.Stat(targetAbs); err == nil {
-			fmt.Printf("Updating hash for: %s\n", targetAbs)
-			return &updateInfo{RelKey: relKey, SourceAbs: sourceAbs, TargetAbs: targetAbs, RelTarget: relTarget}, nil
-		}
-	}
-
-	if _, err := os.Stat(targetAbs); err != nil {
-		fmt.Printf("Target missing, reprocessing: %s\n", targetAbs)
-	} else if !s.db.IsFileChanged(sourceAbs, relKey) {
-		s.st.skipped.Add(1)
-		return nil, nil
-	}
-
-	if plExtensions[ext] {
-		if err := s.handlePlaylist(sourceAbs, targetAbs); err != nil {
-			return nil, err
-		}
-		return &updateInfo{RelKey: relKey, SourceAbs: sourceAbs, TargetAbs: targetAbs, RelTarget: relTarget}, nil
-	}
-	if s.copyOnly || copyExtensions[ext] {
-		if err := s.copyFile(sourceAbs, targetAbs); err != nil {
-			return nil, err
-		}
-		return &updateInfo{RelKey: relKey, SourceAbs: sourceAbs, TargetAbs: targetAbs, RelTarget: relTarget}, nil
-	}
-	if transExtensions[ext] {
-		if err := s.transcodeToMP3(ctx, sourceAbs, targetAbs); err != nil {
-			return nil, err
-		}
-		return &updateInfo{RelKey: relKey, SourceAbs: sourceAbs, TargetAbs: targetAbs, RelTarget: relTarget}, nil
-	}
-	return nil, nil
-}
-
 func (s *syncer) collectFiles(ctx context.Context) ([]string, error) {
 	var out []string
 	err := filepath.WalkDir(s.sourceAbs, func(path string, d fs.DirEntry, err error) error {
@@ -368,123 +485,6 @@ func (s *syncer) collectFiles(ctx context.Context) ([]string, error) {
 		return nil
 	})
 	return out, err
-}
-
-func (s *syncer) processParallel(ctx context.Context, files []string) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	fmt.Println("Compiling list of files to process")
-	toProcess := make([]string, 0, len(files))
-	for _, p := range files {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if s.updateHash {
-			toProcess = append(toProcess, p)
-			continue
-		}
-		rel := relPathUnder(s.sourceAbs, p)
-		relKey := pathKey(rel)
-
-		ext := strings.ToLower(filepath.Ext(p))
-
-		var targetAbs string
-		if plExtensions[ext] {
-			targetAbs = s.targetPathFor(p, nil)
-		} else if s.copyOnly || copyExtensions[ext] {
-			targetAbs = s.targetPathFor(p, nil)
-		} else if transExtensions[ext] {
-			mp3 := ".mp3"
-			targetAbs = s.targetPathFor(p, &mp3)
-		}
-
-		if targetAbs == "" {
-			continue
-		}
-		if _, err := os.Stat(targetAbs); err != nil || s.db.IsFileChanged(p, relKey) {
-			toProcess = append(toProcess, p)
-		} else {
-			s.st.skipped.Add(1)
-		}
-	}
-
-	if len(toProcess) == 0 {
-		fmt.Println("No files need processing")
-		return nil
-	}
-
-	n := s.threads
-	fmt.Printf("Processing %d files using %d threads...\n", len(toProcess), n)
-	sort.Strings(toProcess)
-
-	workCh := make(chan string)
-	updateCh := make(chan *updateInfo, 1024)
-	errCh := make(chan error, 1)
-
-	// Enqueue
-	go func() {
-		defer close(workCh)
-		for _, p := range toProcess {
-			select {
-			case <-ctx.Done():
-				return
-			case workCh <- p:
-			}
-		}
-	}()
-
-	var wg sync.WaitGroup
-	worker := func() {
-		defer wg.Done()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case p, ok := <-workCh:
-				if !ok {
-					return
-				}
-				upd, err := s.syncOne(ctx, p)
-				if err != nil {
-					cancel()
-					// Cancel everyone and stop ffmpeg
-					s.terminateActiveFFmpeg()
-					select {
-					case errCh <- err:
-					default:
-					}
-					return
-				}
-				if upd != nil {
-					updateCh <- upd
-				}
-			}
-		}
-	}
-
-	wg.Add(n)
-	for i := 0; i < n; i++ {
-		go worker()
-	}
-
-	// Close updateCh after workers finish
-	go func() {
-		wg.Wait()
-		close(updateCh)
-	}()
-
-	// Apply updates serially
-	for upd := range updateCh {
-		s.db.Update(upd.RelKey, upd.SourceAbs, upd.TargetAbs, upd.RelTarget)
-	}
-
-	select {
-	case err := <-errCh:
-		return err
-	default:
-		return ctx.Err()
-	}
 }
 
 func (s *syncer) removeDeletedAndOrphans(ctx context.Context, currentRelKeys map[string]bool) error {

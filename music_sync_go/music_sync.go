@@ -72,14 +72,14 @@ func main() {
 		dbPath = filepath.Join(target, dbFilename)
 	}
 
-	d := dbNew(dbPath)
+	myDb := dbNew(dbPath)
 
 	if optPrint {
-		d.PrintRuns()
+		myDb.PrintRuns()
 		return
 	}
 
-	s, err := newSyncer(source, target, d, optDryRun, optCopyOnly, optThreads, optUpdateHash)
+	mySyncer, err := newSyncer(source, target, myDb, optDryRun, optCopyOnly, optThreads, optUpdateHash)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -90,7 +90,7 @@ func main() {
 
 	go func() {
 		<-ctx.Done()
-		s.terminateActiveFFmpeg()
+		mySyncer.terminateActiveFFmpeg()
 	}()
 
 	if optDump >= 0 {
@@ -98,7 +98,7 @@ func main() {
 			fmt.Println("Error: --dump requires --dump-target")
 			os.Exit(1)
 		}
-		if err := s.dumpRun(ctx, optDump, optDumpTarget); err != nil {
+		if err := mySyncer.dumpRun(ctx, optDump, optDumpTarget); err != nil {
 			if err == context.Canceled {
 				fmt.Println("\n[!] Canceled (Ctrl-C).")
 				os.Exit(130)
@@ -110,14 +110,14 @@ func main() {
 	}
 
 	if !optCopyOnly {
-		s.checkDeps()
+		mySyncer.checkDeps()
 	}
 
-	fmt.Printf("Syncing: %s -> %s\n", s.sourceAbs, s.targetAbs)
-	fmt.Printf("Using %d parallel workers\n", s.threads)
+	fmt.Printf("Syncing: %s -> %s\n", mySyncer.sourceAbs, mySyncer.targetAbs)
+	fmt.Printf("Using %d parallel workers\n", mySyncer.threads)
 
 	fmt.Println("Scanning source directory...")
-	files, err := s.collectFiles(ctx)
+	files, err := mySyncer.collectFiles(ctx)
 	if err != nil {
 		if err == context.Canceled {
 			fmt.Println("\n[!] Canceled (Ctrl-C).")
@@ -128,11 +128,11 @@ func main() {
 	}
 	fmt.Printf("Found %d audio files\n", len(files))
 
-	if err := s.processParallel(ctx, files); err != nil {
+	if err := mySyncer.processParallel(ctx, files); err != nil {
 		if err == context.Canceled {
 			fmt.Println("\n[!] Canceled (Ctrl-C).")
-			if !s.dryRun {
-				if err := s.db.Save(); err != nil {
+			if !mySyncer.dryRun {
+				if err := mySyncer.db.Save(); err != nil {
 					fmt.Fprintln(os.Stderr, err)
 				}
 			}
@@ -146,16 +146,16 @@ func main() {
 
 	current := make(map[string]bool, len(files))
 	for _, p := range files {
-		rel := relPathUnder(s.sourceAbs, p)
+		rel := relPathUnder(mySyncer.sourceAbs, p)
 		current[pathKey(rel)] = true
 	}
 
 	fmt.Println("\nChecking for deleted files...")
-	if err := s.removeDeletedAndOrphans(ctx, current); err != nil {
+	if err := mySyncer.removeDeletedAndOrphans(ctx, current); err != nil {
 		if err == context.Canceled {
 			fmt.Println("\n[!] Canceled (Ctrl-C).")
-			if !s.dryRun {
-				if err := s.db.Save(); err != nil {
+			if !mySyncer.dryRun {
+				if err := mySyncer.db.Save(); err != nil {
 					fmt.Fprintln(os.Stderr, err)
 				}
 			}
@@ -165,18 +165,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	if !s.dryRun {
-		if err := s.db.Save(); err != nil {
+	if !mySyncer.dryRun {
+		if err := mySyncer.db.Save(); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 		}
 	}
 
 	fmt.Println("\n==================================================")
 	fmt.Println("Sync complete!")
-	fmt.Print(s.st.String())
+	fmt.Print(mySyncer.st.String())
 	fmt.Println("==================================================")
 
-	for k := range s.db.Data.Files {
+	for k := range mySyncer.db.Data.Files {
 		if strings.HasPrefix(k, "x:") {
 			fmt.Printf("Note: DB contains non-UTF8 paths (stored as hex keys), e.g. %s\n", pathKeyDecode(k))
 			break
