@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,23 +21,34 @@ import (
 	"time"
 )
 
-type syncer struct {
-	sourceAbs  string
-	targetAbs  string
-	db         *db
-	dryRun     bool
-	copyOnly   bool
-	threads    int
-	updateHash bool
-
-	st stats
-
-	mu   sync.Mutex
-	pids map[int]struct{}
+type syncPlaylistEntry struct {
+	SourceFile string
+	TargetFile string
 }
 
-func newSyncer(source, target string, myDb *db, dry, copyOnly bool, threads int, updateHash bool) (*syncer, error) {
-	sa, err := filepath.Abs(source)
+type syncPlaylist struct {
+	SourceAbs string
+	TargetAbs string
+	Entries   []syncPlaylistEntry
+}
+type syncer struct {
+	sourceAbsolutePath string
+	targetAbsolutePath string
+	db                 *db
+	dryRun             bool
+	copyOnly           bool
+	threads            int
+	updateHash         bool
+	plRewrite          bool
+	st                 stats
+
+	mu        sync.Mutex
+	pids      map[int]struct{}
+	playlists map[string]syncPlaylist
+}
+
+func newSyncer(source, target string, myDb *db, dry, copyOnly bool, threads int, updateHash, plRewrite bool) (*syncer, error) {
+	sourceAbsolute, err := filepath.Abs(source)
 	if err != nil {
 		return nil, err
 	}
@@ -47,23 +60,17 @@ func newSyncer(source, target string, myDb *db, dry, copyOnly bool, threads int,
 		threads = runtime.NumCPU()
 	}
 	return &syncer{
-		sourceAbs:  sa,
-		targetAbs:  ta,
-		db:         myDb,
-		dryRun:     dry,
-		copyOnly:   copyOnly,
-		threads:    threads,
-		updateHash: updateHash,
-		pids:       map[int]struct{}{},
+		sourceAbsolutePath: sourceAbsolute,
+		targetAbsolutePath: ta,
+		db:                 myDb,
+		dryRun:             dry,
+		copyOnly:           copyOnly,
+		threads:            threads,
+		updateHash:         updateHash,
+		plRewrite:          plRewrite,
+		pids:               map[int]struct{}{},
+		playlists:          map[string]syncPlaylist{},
 	}, nil
-}
-
-func (s *syncer) checkDeps() {
-	if !hasTool("ffmpeg") || !hasTool("ffprobe") {
-		fmt.Println("Error: Missing required tools: ffmpeg/ffprobe")
-		fmt.Println("Please install: sudo dnf install ffmpeg")
-		os.Exit(1)
-	}
 }
 
 func (s *syncer) processParallel(ctx context.Context, files []string) error {
@@ -80,7 +87,7 @@ func (s *syncer) processParallel(ctx context.Context, files []string) error {
 			toProcess = append(toProcess, p)
 			continue
 		}
-		rel := relPathUnder(s.sourceAbs, p)
+		rel := relPathUnder(s.sourceAbsolutePath, p)
 		relKey := pathKey(rel)
 
 		ext := strings.ToLower(filepath.Ext(p))
@@ -111,7 +118,7 @@ func (s *syncer) processParallel(ctx context.Context, files []string) error {
 	}
 
 	n := s.threads
-	fmt.Printf("Processing %d files using %d threads...\n", len(toProcess), n)
+	slog.Info(fmt.Sprintf("Processing %d files using %d threads...", len(toProcess), n))
 	sort.Strings(toProcess)
 
 	workCh := make(chan string)
@@ -184,7 +191,7 @@ func (s *syncer) processParallel(ctx context.Context, files []string) error {
 }
 
 func (s *syncer) syncOne(ctx context.Context, sourceAbs string) (*updateInfo, error) {
-	rel := relPathUnder(s.sourceAbs, sourceAbs)
+	rel := relPathUnder(s.sourceAbsolutePath, sourceAbs)
 	relKey := pathKey(rel)
 
 	ext := strings.ToLower(filepath.Ext(sourceAbs))
@@ -200,17 +207,17 @@ func (s *syncer) syncOne(ctx context.Context, sourceAbs string) (*updateInfo, er
 	} else {
 		return nil, nil
 	}
-	relTarget := relPathUnder(s.targetAbs, targetAbs)
+	relTarget := relPathUnder(s.targetAbsolutePath, targetAbs)
 
 	if s.updateHash {
 		if _, err := os.Stat(targetAbs); err == nil {
-			fmt.Printf("Updating hash for: %s\n", targetAbs)
+			slog.Info("Updating hash for", "file", targetAbs)
 			return &updateInfo{RelKey: relKey, SourceAbs: sourceAbs, TargetAbs: targetAbs, RelTarget: relTarget}, nil
 		}
 	}
 
 	if _, err := os.Stat(targetAbs); err != nil {
-		fmt.Printf("Target missing, reprocessing: %s\n", targetAbs)
+		slog.Info("Target missing, reprocessing", "file", targetAbs)
 	} else if !s.db.IsFileChanged(sourceAbs, relKey) {
 		s.st.skipped.Add(1)
 		return nil, nil
@@ -237,9 +244,102 @@ func (s *syncer) syncOne(ctx context.Context, sourceAbs string) (*updateInfo, er
 	return nil, nil
 }
 
+func (s *syncer) rewritePlaylists(ctx context.Context) error {
+	fmt.Println("Rewriting playlists if needed...")
+	targetMetaData := make(map[string]songTagData)
+	sourceMetaData := make(map[string]songTagData)
+	allTargetFiles := []string{}
+	var err error
+	pls := s.playlistsSnapshot()
+
+	for name := range pls {
+		playlist := pls[name]
+		var changed = false
+		slog.Info("Playlist Name", "name", name)
+		slog.Info("Source Path", "path", playlist.SourceAbs)
+
+		// You can also nest a loop to iterate through the Entries slice
+		for i := range playlist.Entries {
+			lookFile := s.targetPathFor(playlist.Entries[i].TargetFile, nil)
+			if _, statErr := os.Stat(lookFile); statErr == nil {
+				continue
+			} else if errors.Is(statErr, os.ErrNotExist) {
+
+				// ok, we need to try to find it anywhere inside the target folders
+				slog.Info("File does NOT exist", "file", playlist.Entries[i].TargetFile)
+
+				// Build metadata for all target files if not already done (lazy)
+				if len(allTargetFiles) == 0 {
+					slog.Info("Collecting all target files...")
+					allTargetFiles, err = collectFiles(ctx, s.sourceAbsolutePath)
+					if err != nil {
+						return err
+					}
+				}
+
+				// get source metadata
+				if _, ok := sourceMetaData[playlist.Entries[i].SourceFile]; !ok {
+					sourceTagData, err := getSongMetadata(playlist.Entries[i].SourceFile)
+					if err != nil {
+						return err
+					}
+					sourceMetaData[playlist.Entries[i].SourceFile] = sourceTagData
+				}
+				if sourceTagData, ok := sourceMetaData[playlist.Entries[i].SourceFile]; ok {
+
+					// try to find a match in targetMetaData, first using artist+title, then fallback to title only
+					var match *songTagData = findSongMatch(sourceTagData, targetMetaData)
+					if match == nil {
+						// maybe not all files have been added to the targetMetaData map yet
+						targetMetaData, err = getSongMetadataForFiles(ctx, allTargetFiles, targetMetaData, sourceTagData)
+						if err != nil {
+							return err
+						}
+						match = findSongMatch(sourceTagData, targetMetaData)
+					}
+
+					if match != nil {
+						slog.Info("Found match", "artist", sourceTagData.Artist, "title", sourceTagData.Title, "file", match.SourceFile)
+						playlist.Entries[i].TargetFile = relPathUnder(s.targetAbsolutePath, match.SourceFile)
+						changed = true
+					} else {
+						slog.Info("No match found", "artist", sourceTagData.Artist, "title", sourceTagData.Title)
+					}
+				}
+			}
+		}
+		if changed {
+			// write the changed playlist back to disk
+			slog.Info("Rewriting playlist", "file", playlist.TargetAbs)
+			out, err := os.Create(playlist.TargetAbs)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = out.Close() }()
+			for _, entry := range playlist.Entries {
+				if _, err := fmt.Fprintln(out, entry.TargetFile); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (s *syncer) playlistsSnapshot() map[string]syncPlaylist {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	snapshot := make(map[string]syncPlaylist, len(s.playlists))
+	for key, playlist := range s.playlists {
+		snapshot[key] = playlist
+	}
+	return snapshot
+}
+
 func (s *syncer) targetPathFor(sourceAbs string, newExt *string) string {
-	rel := relPathUnder(s.sourceAbs, sourceAbs)
-	tgt := filepath.Join(s.targetAbs, rel)
+	rel := relPathUnder(s.sourceAbsolutePath, sourceAbs)
+	tgt := filepath.Join(s.targetAbsolutePath, rel)
 	if newExt != nil {
 		tgt = withSuffix(tgt, *newExt)
 	}
@@ -248,7 +348,7 @@ func (s *syncer) targetPathFor(sourceAbs string, newExt *string) string {
 
 func (s *syncer) copyFile(src, dst string) error {
 	if s.dryRun {
-		fmt.Printf("[DRY RUN] Would copy: %s -> %s\n", src, dst)
+		slog.Info("Dry run: would copy file", "src", src, "dst", dst)
 		return nil
 	}
 	if err := mkdirForFile(dst); err != nil {
@@ -274,14 +374,14 @@ func (s *syncer) copyFile(src, dst string) error {
 		return err
 	}
 
-	fmt.Printf("Copied: %s\n", filepath.Base(src))
+	slog.Info("Copied file", "file", filepath.Base(src))
 	s.st.copied.Add(1)
 	return nil
 }
 
 func (s *syncer) handlePlaylist(src, dst string) error {
 	if s.dryRun {
-		fmt.Printf("[DRY RUN] Would handle playlist: %s -> %s\n", src, dst)
+		slog.Info("Dry run: would handle playlist", "src", src, "dst", dst)
 		return nil
 	}
 	in, err := os.Open(src)
@@ -299,12 +399,16 @@ func (s *syncer) handlePlaylist(src, dst string) error {
 	}
 	defer func() { _ = out.Close() }()
 
-	srcRoot := filepath.Clean(s.sourceAbs)
-	dstRoot := filepath.Clean(s.targetAbs)
+	srcRoot := filepath.Clean(s.sourceAbsolutePath)
+	dstRoot := filepath.Clean(s.targetAbsolutePath)
 	dstDir := filepath.Dir(dst)
 
 	sc := bufio.NewScanner(in)
 	lineNo := 0
+	p := syncPlaylist{
+		SourceAbs: src,
+		TargetAbs: dst,
+	}
 	for sc.Scan() {
 		lineNo++
 		line := sc.Text()
@@ -318,6 +422,9 @@ func (s *syncer) handlePlaylist(src, dst string) error {
 		line = strings.TrimRight(line, "\r\n")
 		if strings.HasPrefix(line, "#") || line == "" {
 			continue
+		}
+		pl := syncPlaylistEntry{
+			SourceFile: line,
 		}
 
 		// Normalize Windows separators.
@@ -342,12 +449,21 @@ func (s *syncer) handlePlaylist(src, dst string) error {
 		if transExtensions[ext] && !s.copyOnly {
 			line = withSuffix(line, ".mp3")
 		}
-
+		pl.TargetFile = line
+		p.Entries = append(p.Entries, pl)
 		if _, err := fmt.Fprintln(out, line); err != nil {
 			return err
 		}
 	}
-	return sc.Err()
+	if err := sc.Err(); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	s.playlists[src] = p
+	s.mu.Unlock()
+
+	return nil
 }
 
 func (s *syncer) replayGainDB(ctx context.Context, sourceAbs string) (*float64, error) {
@@ -399,7 +515,7 @@ func (s *syncer) terminateActiveFFmpeg() {
 
 func (s *syncer) transcodeToMP3(ctx context.Context, sourceAbs, targetAbs string) error {
 	if s.dryRun {
-		fmt.Printf("[DRY RUN] Would transcode: %s -> %s\n", sourceAbs, targetAbs)
+		slog.Info("Dry run: would transcode", "src", sourceAbs, "dst", targetAbs)
 		return nil
 	}
 	if err := mkdirForFile(targetAbs); err != nil {
@@ -453,7 +569,7 @@ func (s *syncer) transcodeToMP3(ctx context.Context, sourceAbs, targetAbs string
 	if err != nil {
 		return fmt.Errorf("error transcoding %s:\n%s", sourceAbs, stderr.String())
 	}
-	fmt.Printf("Transcoded: %s -> %s\n", filepath.Base(sourceAbs), filepath.Base(targetAbs))
+	slog.Info("Transcoded file", "src", filepath.Base(sourceAbs), "dst", filepath.Base(targetAbs))
 	s.st.transcoded.Add(1)
 	return nil
 }
@@ -465,30 +581,8 @@ type updateInfo struct {
 	RelTarget string
 }
 
-func (s *syncer) collectFiles(ctx context.Context) ([]string, error) {
-	var out []string
-	err := filepath.WalkDir(s.sourceAbs, func(path string, d fs.DirEntry, err error) error {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if err != nil {
-			// keep walking, but report error up
-			return err
-		}
-		if d.IsDir() {
-			return nil
-		}
-		ext := strings.ToLower(filepath.Ext(path))
-		if audioExtensions[ext] {
-			out = append(out, path)
-		}
-		return nil
-	})
-	return out, err
-}
-
 func (s *syncer) removeDeletedAndOrphans(ctx context.Context, currentRelKeys map[string]bool) error {
-	fmt.Println("Looking for deleted files")
+	slog.Info("Looking for deleted files")
 	for _, relKey := range s.db.AllSyncedRelKeys() {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -501,14 +595,14 @@ func (s *syncer) removeDeletedAndOrphans(ctx context.Context, currentRelKeys map
 
 		// Prefer rel_target with current root
 		if info.RelTarget != "" {
-			currentTarget := filepath.Join(s.targetAbs, info.RelTarget)
+			currentTarget := filepath.Join(s.targetAbsolutePath, info.RelTarget)
 			if st, err := os.Stat(currentTarget); err == nil && !st.IsDir() {
 				deleted = true
 				if s.dryRun {
-					fmt.Printf("[DRY RUN] Would delete: %s\n", currentTarget)
+					slog.Info("Dry run: would delete file", "file", currentTarget)
 				} else {
 					_ = os.Remove(currentTarget)
-					fmt.Printf("Deleted: %s\n", currentTarget)
+					slog.Info("Deleted file", "file", currentTarget)
 					s.st.deleted.Add(1)
 				}
 			}
@@ -517,14 +611,14 @@ func (s *syncer) removeDeletedAndOrphans(ctx context.Context, currentRelKeys map
 		// Fallback: absolute DB path only if under current target root
 		if !deleted && info.Target != "" {
 			tgt := filepath.Clean(info.Target)
-			root := filepath.Clean(s.targetAbs) + string(os.PathSeparator)
+			root := filepath.Clean(s.targetAbsolutePath) + string(os.PathSeparator)
 			if strings.HasPrefix(tgt+string(os.PathSeparator), root) || strings.HasPrefix(tgt, root) {
 				if st, err := os.Stat(tgt); err == nil && !st.IsDir() {
 					if s.dryRun {
-						fmt.Printf("[DRY RUN] Would delete: %s\n", tgt)
+						slog.Info("Dry run: would delete file", "file", tgt)
 					} else {
 						_ = os.Remove(tgt)
-						fmt.Printf("Deleted: %s\n", tgt)
+						slog.Info("Deleted file", "file", tgt)
 						s.st.deleted.Add(1)
 					}
 				}
@@ -550,12 +644,12 @@ func (s *syncer) removeDeletedAndOrphans(ctx context.Context, currentRelKeys map
 			known[absKey(info.Target)] = true
 		}
 		if info.RelTarget != "" {
-			known[absKey(filepath.Join(s.targetAbs, info.RelTarget))] = true
+			known[absKey(filepath.Join(s.targetAbsolutePath, info.RelTarget))] = true
 		}
 	}
 
 	var orphans []string
-	filepath.WalkDir(s.targetAbs, func(path string, d fs.DirEntry, err error) error {
+	filepath.WalkDir(s.targetAbsolutePath, func(path string, d fs.DirEntry, err error) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -577,12 +671,12 @@ func (s *syncer) removeDeletedAndOrphans(ctx context.Context, currentRelKeys map
 			return ctx.Err()
 		}
 		if s.dryRun {
-			fmt.Printf("[DRY RUN] Would delete orphan target file: %s\n", p)
+			slog.Info("Dry run: would delete orphan target file", "file", p)
 			continue
 		}
 		_ = os.Remove(p)
 		if _, err := os.Stat(p); os.IsNotExist(err) {
-			fmt.Printf("Deleted orphan target file: %s\n", p)
+			slog.Info("Deleted orphan target file", "file", p)
 			s.st.deleted.Add(1)
 		}
 	}
@@ -592,7 +686,7 @@ func (s *syncer) removeDeletedAndOrphans(ctx context.Context, currentRelKeys map
 		return nil
 	}
 	var dirs []string
-	filepath.WalkDir(s.targetAbs, func(path string, d fs.DirEntry, err error) error {
+	filepath.WalkDir(s.targetAbsolutePath, func(path string, d fs.DirEntry, err error) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -606,7 +700,7 @@ func (s *syncer) removeDeletedAndOrphans(ctx context.Context, currentRelKeys map
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if filepath.Clean(dir) == filepath.Clean(s.targetAbs) {
+		if filepath.Clean(dir) == filepath.Clean(s.targetAbsolutePath) {
 			continue
 		}
 		entries, err := os.ReadDir(dir)
@@ -615,7 +709,7 @@ func (s *syncer) removeDeletedAndOrphans(ctx context.Context, currentRelKeys map
 		}
 		if len(entries) == 0 {
 			if err := os.Remove(dir); err == nil {
-				fmt.Printf("Removed empty directory: %s\n", dir)
+				slog.Info("Removed empty directory", "dir", dir)
 			}
 		}
 	}
@@ -625,10 +719,10 @@ func (s *syncer) removeDeletedAndOrphans(ctx context.Context, currentRelKeys map
 func (s *syncer) dumpRun(ctx context.Context, runID int64, dumpTarget string) error {
 	entries := s.db.FilesByRun(runID)
 	if len(entries) == 0 {
-		fmt.Printf("No files found for Run ID: %d\n", runID)
+		slog.Info("No files found for Run ID", "runID", runID)
 		return nil
 	}
-	fmt.Printf("Dumping %d files from Run %d to %s...\n", len(entries), runID, dumpTarget)
+	slog.Info("Dumping files from Run", "count", len(entries), "runID", runID, "dumpTarget", dumpTarget)
 	for _, e := range entries {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -639,37 +733,22 @@ func (s *syncer) dumpRun(ctx context.Context, runID int64, dumpTarget string) er
 			continue
 		}
 		if st, err := os.Stat(absSrc); err != nil || st.IsDir() {
-			fmt.Printf("Warning: Source file %s missing, skipping.\n", absSrc)
+			slog.Warn("Warning: Source file missing, skipping", "file", absSrc)
 			continue
 		}
 		dst := filepath.Join(dumpTarget, rel)
 		if s.dryRun {
-			fmt.Printf("[DRY RUN] Would copy %s -> %s\n", absSrc, dst)
+			slog.Info("Dry run: would copy file", "src", absSrc, "dst", dst)
 			continue
 		}
 		if err := mkdirForFile(dst); err != nil {
 			return err
 		}
 		if err := copyFileSimple(absSrc, dst); err != nil {
-			fmt.Fprintf(os.Stderr, "Copy failed: %v\n", err)
+			slog.Error("Copy failed", "src", absSrc, "dst", dst, "error", err)
 			continue
 		}
-		fmt.Printf("Dumped: %s\n", rel)
+		slog.Info("Dumped file", "file", rel)
 	}
 	return nil
-}
-
-func copyFileSimple(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = out.Close() }()
-	_, err = io.Copy(out, in)
-	return err
 }

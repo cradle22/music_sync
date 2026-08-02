@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -93,4 +95,26 @@ func mkdirForFile(path string) error {
 func hasTool(name string) bool {
 	_, err := exec.LookPath(name)
 	return err == nil
+}
+
+func collectFiles(ctx context.Context, sourceAbsolutePath string) ([]string, error) {
+	var out []string
+	err := filepath.WalkDir(sourceAbsolutePath, func(path string, d fs.DirEntry, err error) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err != nil {
+			// keep walking, but report error up
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		ext := strings.ToLower(filepath.Ext(path))
+		if audioExtensions[ext] {
+			out = append(out, path)
+		}
+		return nil
+	})
+	return out, err
 }

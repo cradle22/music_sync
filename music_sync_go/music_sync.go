@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -12,7 +13,7 @@ import (
 )
 
 func usage() {
-	fmt.Println(`Usage: music_sync <source> <target> [options]
+	fmt.Println(`Usage: music_sync [options] <source> <target>
 
   --print               Print all distinct run IDs and runtimes
   --dump RUNID          Copy all files from a specific run ID to --dump-target
@@ -21,11 +22,52 @@ func usage() {
   --copy-only           Copy all files without transcoding
   --threads|-j N        Number of parallel workers (default: CPU count)
   --db PATH             Database file location (default: target/.music_sync_db.json)
-  --update-hash         Updates the hash if the target file exists`)
+  --update-hash         Updates the hash if the target file exists
+  --plrewrite           Tries to rewrite playlist files, finding songs in the library`)
 	os.Exit(1)
 }
 
+func reorderArgs(args []string, boolFlags map[string]struct{}) ([]string, []string, error) {
+	flagArgs := make([]string, 0, len(args))
+	positionals := make([]string, 0, 2)
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			positionals = append(positionals, args[i+1:]...)
+			break
+		}
+		if !strings.HasPrefix(arg, "-") || arg == "-" {
+			positionals = append(positionals, arg)
+			continue
+		}
+
+		flagArgs = append(flagArgs, arg)
+		flagName := arg
+		if eq := strings.IndexByte(flagName, '='); eq >= 0 {
+			flagName = flagName[:eq]
+		}
+		flagName = strings.TrimLeft(flagName, "-")
+
+		if _, ok := boolFlags[flagName]; ok {
+			continue
+		}
+		if strings.Contains(arg, "=") {
+			continue
+		}
+		if i+1 >= len(args) {
+			return nil, nil, fmt.Errorf("flag %s requires a value", arg)
+		}
+		i++
+		flagArgs = append(flagArgs, args[i])
+	}
+
+	return flagArgs, positionals, nil
+}
+
 func main() {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	slog.SetDefault(logger)
 	var (
 		optPrint      bool
 		optDump       int64
@@ -35,21 +77,39 @@ func main() {
 		optThreads    int
 		optDB         string
 		optUpdateHash bool
+		optPLRewrite  bool
 	)
 
-	flag.BoolVar(&optPrint, "print", false, "")
-	flag.Int64Var(&optDump, "dump", -1, "")
-	flag.StringVar(&optDumpTarget, "dump-target", "", "")
-	flag.BoolVar(&optDryRun, "dry-run", false, "")
-	flag.BoolVar(&optCopyOnly, "copy-only", false, "")
-	flag.IntVar(&optThreads, "threads", 0, "")
-	flag.IntVar(&optThreads, "j", 0, "")
-	flag.StringVar(&optDB, "db", "", "")
-	flag.BoolVar(&optUpdateHash, "update-hash", false, "")
-	flag.Usage = usage
-	flag.Parse()
+	fs := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	fs.Usage = usage
 
-	args := flag.Args()
+	fs.BoolVar(&optPrint, "print", false, "")
+	fs.Int64Var(&optDump, "dump", -1, "")
+	fs.StringVar(&optDumpTarget, "dump-target", "", "")
+	fs.BoolVar(&optDryRun, "dry-run", false, "")
+	fs.BoolVar(&optCopyOnly, "copy-only", false, "")
+	fs.IntVar(&optThreads, "threads", 0, "")
+	fs.IntVar(&optThreads, "j", 0, "")
+	fs.StringVar(&optDB, "db", "", "")
+	fs.BoolVar(&optUpdateHash, "update-hash", false, "")
+	fs.BoolVar(&optPLRewrite, "plrewrite", false, "")
+
+	flagArgs, args, err := reorderArgs(os.Args[1:], map[string]struct{}{
+		"print":       {},
+		"dry-run":     {},
+		"copy-only":   {},
+		"update-hash": {},
+		"plrewrite":   {},
+	})
+	if err != nil {
+		slog.Error("Failed to parse arguments", "error", err)
+		usage()
+	}
+	if err := fs.Parse(flagArgs); err != nil {
+		usage()
+	}
+
 	if len(args) < 2 {
 		usage()
 	}
@@ -58,11 +118,11 @@ func main() {
 
 	st, err := os.Stat(source)
 	if err != nil {
-		fmt.Printf("Error: Source folder does not exist: %s\n", source)
+		slog.Error("Failed to read file", "file", source, "error", err)
 		os.Exit(1)
 	}
 	if !st.IsDir() {
-		fmt.Printf("Error: Source is not a directory: %s\n", source)
+		slog.Error("Source is not a directory", "file", source)
 		os.Exit(1)
 	}
 	_ = os.MkdirAll(target, 0o755)
@@ -79,9 +139,9 @@ func main() {
 		return
 	}
 
-	mySyncer, err := newSyncer(source, target, myDb, optDryRun, optCopyOnly, optThreads, optUpdateHash)
+	mySyncer, err := newSyncer(source, target, myDb, optDryRun, optCopyOnly, optThreads, optUpdateHash, optPLRewrite)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		slog.Error("Failed to create syncer", "error", err)
 		os.Exit(1)
 	}
 
@@ -95,29 +155,28 @@ func main() {
 
 	if optDump >= 0 {
 		if optDumpTarget == "" {
-			fmt.Println("Error: --dump requires --dump-target")
+			slog.Error("Error: --dump requires --dump-target")
 			os.Exit(1)
 		}
 		if err := mySyncer.dumpRun(ctx, optDump, optDumpTarget); err != nil {
 			if err == context.Canceled {
-				fmt.Println("\n[!] Canceled (Ctrl-C).")
+				slog.Error("Canceled (Ctrl-C).")
 				os.Exit(130)
 			}
-			fmt.Fprintln(os.Stderr, err)
+			slog.Error("Failed to dump run", "error", err)
 			os.Exit(1)
 		}
 		return
 	}
 
 	if !optCopyOnly {
-		mySyncer.checkDeps()
+		checkDeps()
 	}
 
-	fmt.Printf("Syncing: %s -> %s\n", mySyncer.sourceAbs, mySyncer.targetAbs)
-	fmt.Printf("Using %d parallel workers\n", mySyncer.threads)
-
-	fmt.Println("Scanning source directory...")
-	files, err := mySyncer.collectFiles(ctx)
+	slog.Info("Starting sync", "source", mySyncer.sourceAbsolutePath, "target", mySyncer.targetAbsolutePath)
+	slog.Info(fmt.Sprintf("Using %d parallel workers", mySyncer.threads))
+	slog.Info("Scanning source directory...")
+	files, err := collectFiles(ctx, mySyncer.sourceAbsolutePath)
 	if err != nil {
 		if err == context.Canceled {
 			fmt.Println("\n[!] Canceled (Ctrl-C).")
@@ -126,59 +185,64 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	fmt.Printf("Found %d audio files\n", len(files))
+	slog.Info(fmt.Sprintf("Found %d audio files", len(files)))
 
 	if err := mySyncer.processParallel(ctx, files); err != nil {
 		if err == context.Canceled {
-			fmt.Println("\n[!] Canceled (Ctrl-C).")
+			slog.Error("Canceled (Ctrl-C).")
 			if !mySyncer.dryRun {
 				if err := mySyncer.db.Save(); err != nil {
-					fmt.Fprintln(os.Stderr, err)
+					slog.Error("Failed to save DB", "error", err)
 				}
 			}
 			os.Exit(130)
 		}
-		fmt.Println("\n==================================================")
-		fmt.Println("Sync interrupted!")
-		fmt.Fprintln(os.Stderr, err)
+		slog.Error("Sync interrupted!", "error", err)
 		os.Exit(1)
+	}
+
+	if mySyncer.plRewrite {
+		if err := mySyncer.rewritePlaylists(ctx); err != nil {
+			slog.Error("Failed to rewrite playlists", "error", err)
+			os.Exit(1)
+		}
 	}
 
 	current := make(map[string]bool, len(files))
 	for _, p := range files {
-		rel := relPathUnder(mySyncer.sourceAbs, p)
+		rel := relPathUnder(mySyncer.sourceAbsolutePath, p)
 		current[pathKey(rel)] = true
 	}
 
-	fmt.Println("\nChecking for deleted files...")
+	slog.Info("Checking for deleted files...")
 	if err := mySyncer.removeDeletedAndOrphans(ctx, current); err != nil {
 		if err == context.Canceled {
-			fmt.Println("\n[!] Canceled (Ctrl-C).")
+			slog.Error("Canceled (Ctrl-C).")
 			if !mySyncer.dryRun {
 				if err := mySyncer.db.Save(); err != nil {
-					fmt.Fprintln(os.Stderr, err)
+					slog.Error("Failed to save DB", "error", err)
 				}
 			}
 			os.Exit(130)
 		}
-		fmt.Fprintln(os.Stderr, err)
+		slog.Error("Failed to remove deleted and/or orphaned files", "error", err)
 		os.Exit(1)
 	}
 
 	if !mySyncer.dryRun {
 		if err := mySyncer.db.Save(); err != nil {
-			fmt.Fprintln(os.Stderr, err)
+			slog.Error("Failed to save DB", "error", err)
 		}
 	}
 
-	fmt.Println("\n==================================================")
-	fmt.Println("Sync complete!")
-	fmt.Print(mySyncer.st.String())
-	fmt.Println("==================================================")
+	slog.Info("==================================================")
+	slog.Info("Sync complete!")
+	slog.Info(mySyncer.st.String())
+	slog.Info("==================================================")
 
 	for k := range mySyncer.db.Data.Files {
 		if strings.HasPrefix(k, "x:") {
-			fmt.Printf("Note: DB contains non-UTF8 paths (stored as hex keys), e.g. %s\n", pathKeyDecode(k))
+			slog.Info(fmt.Sprintf("Note: DB contains non-UTF8 paths (stored as hex keys), e.g. %s", pathKeyDecode(k)))
 			break
 		}
 	}

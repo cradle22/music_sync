@@ -11,6 +11,8 @@
         "--threads=1",
         "/home/cradle/Shares/music/Other/",
         "/home/cradle/Shares/music/Handy_Music/",
+        "--dump=2",
+        "--dump-target=/home/cradle/Music/Handy/"
         
       ]
     }
